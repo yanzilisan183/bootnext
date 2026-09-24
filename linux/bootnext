@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+#
+# bootnext.sh - Quickly switch the boot OS on UEFI systems.
+# Reads UEFI boot entries via efibootmgr and sets either BootNext (one-shot)
+# or the default BootOrder (permanent).
+
+# ============ Color helpers ============
+if [ -t 1 ]; then
+    C_GREEN=$'\033[0;32m'
+    C_YELLOW=$'\033[0;33m'
+    C_RED=$'\033[0;31m'
+    C_CYAN=$'\033[0;36m'
+    C_GRAY=$'\033[0;90m'
+    C_RESET=$'\033[0m'
+else
+    C_GREEN=''
+    C_YELLOW=''
+    C_RED=''
+    C_CYAN=''
+    C_GRAY=''
+    C_RESET=''
+fi
+
+# ============ Self-elevation ============
+if [ "$EUID" -ne 0 ]; then
+    script_path=$(readlink -f "$0")
+    exec sudo "$script_path" "$@"
+fi
+
+# ============ Argument parsing ============
+help=0
+list=0
+no_reboot=0
+yes_reboot=0
+only_next=0
+default=0
+command=""
+
+valid_cmds=(ubuntu windows usb)
+
+for arg in "$@"; do
+    lower=$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')
+    case "$lower" in
+        -h|--help)      help=1 ;;
+        -l|--list)      list=1 ;;
+        -n|--no-reboot) no_reboot=1 ;;
+        -y|--reboot)    yes_reboot=1 ;;
+        -1|--only-next) only_next=1 ;;
+        -d|--default)   default=1 ;;
+        -*)
+            # Unknown option: ignore (mirrors the PowerShell behavior).
+            ;;
+        *)
+            matched=0
+            for v in "${valid_cmds[@]}"; do
+                if [ "$lower" = "$v" ]; then
+                    command="$lower"
+                    matched=1
+                    break
+                fi
+            done
+            if [ "$matched" -eq 0 ]; then
+                command="$arg"
+            fi
+            ;;
+    esac
+done
+
+# -------- Mutual exclusivity --------
+if [ "$only_next" -eq 1 ] && [ "$default" -eq 1 ]; then
+    printf '%b\n' "${C_RED}Error: -1/--only-next and -d/--default are mutually exclusive.${C_RESET}"
+    exit 1
+fi
+if [ "$no_reboot" -eq 1 ] && [ "$yes_reboot" -eq 1 ]; then
+    printf '%b\n' "${C_RED}Error: -n/--no-reboot and -y/--reboot are mutually exclusive.${C_RESET}"
+    exit 1
+fi
+if [ "$only_next" -eq 0 ] && [ "$default" -eq 0 ]; then
+    default=1
+fi
+
+# ============ Help ============
+show_help() {
+cat <<'EOF'
+bootnext - Quickly switch the boot OS.
+
+Usage:
+    bootnext <target> [options]
+
+Targets:
+    ubuntu          Boot into Ubuntu
+    windows         Boot into Windows
+    usb             Boot from a USB device
+
+Options:
+    -h, --help      Show this help
+    -l, --list      List all UEFI boot entries  (-l is lowercase letter L)
+    -1, --only-next Set BootNext only, one-shot (-1 is number one)
+    -d, --default   Change default BootOrder (default, mutually exclusive with -1)
+    -n, --no-reboot Do not reboot (mutually exclusive with -y)
+    -y, --reboot    Reboot now    (mutually exclusive with -n)
+
+Examples:
+    bootnext ubuntu               # permanent switch to Ubuntu; ask before reboot
+    bootnext ubuntu --default     # same as above
+    bootnext windows --only-next  # one-shot boot to Windows; ask before reboot
+    bootnext ubuntu -1 -n         # one-shot, do not reboot
+    bootnext ubuntu -1 -y         # one-shot, reboot immediately
+    bootnext --list
+EOF
+}
+
+# ============ UEFI parsing ============
+declare -a ENTRY_IDS=()
+declare -a ENTRY_DESCS=()
+declare -a ENTRY_PATHS=()
+declare -a BOOT_ORDER=()
+BOOT_CURRENT=""
+BOOT_NEXT=""
+
+parse_uefi() {
+    ENTRY_IDS=()
+    ENTRY_DESCS=()
+    ENTRY_PATHS=()
+    BOOT_ORDER=()
+    BOOT_CURRENT=""
+    BOOT_NEXT=""
+
+    local line
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^BootCurrent:[[:space:]]+([0-9A-Fa-f]+) ]]; then
+            BOOT_CURRENT="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^BootNext:[[:space:]]+([0-9A-Fa-f]+) ]]; then
+            BOOT_NEXT="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^BootOrder:[[:space:]]+(.+)$ ]]; then
+            local order_str="${BASH_REMATCH[1]}"
+            IFS=',' read -r -a BOOT_ORDER <<< "$order_str"
+        elif [[ "$line" =~ ^Boot([0-9A-Fa-f]{4})(\*)?[[:space:]]+(.*)$ ]]; then
+            local id="${BASH_REMATCH[1]}"
+            local rest="${BASH_REMATCH[3]}"
+            local desc=""
+            local path=""
+            if [[ "$rest" == *$'\t'* ]]; then
+                desc="${rest%%$'\t'*}"
+                path="${rest#*$'\t'}"
+            else
+                desc="$rest"
+            fi
+            ENTRY_IDS+=("$id")
+            ENTRY_DESCS+=("$desc")
+            ENTRY_PATHS+=("$path")
+        fi
+    done < <(efibootmgr 2>/dev/null)
+}
+
+# Returns the index of the first entry matching any pattern (case-insensitive).
+# Description is preferred over path.
+find_entry_by_patterns() {
+    local n=${#ENTRY_IDS[@]}
+    local pat pat_lower desc_lower path_lower
+    for pat in "$@"; do
+        pat_lower=$(printf '%s' "$pat" | tr '[:upper:]' '[:lower:]')
+        for ((i = 0; i < n; i++)); do
+            desc_lower=$(printf '%s' "${ENTRY_DESCS[$i]}" | tr '[:upper:]' '[:lower:]')
+            if [[ "$desc_lower" == *"$pat_lower"* ]]; then
+                echo "$i"
+                return 0
+            fi
+        done
+    done
+    for pat in "$@"; do
+        pat_lower=$(printf '%s' "$pat" | tr '[:upper:]' '[:lower:]')
+        for ((i = 0; i < n; i++)); do
+            path_lower=$(printf '%s' "${ENTRY_PATHS[$i]}" | tr '[:upper:]' '[:lower:]')
+            if [[ "$path_lower" == *"$pat_lower"* ]]; then
+                echo "$i"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# Print the description of a given boot id (falls back to the id itself).
+desc_of_id() {
+    local id="$1"
+    local i
+    for ((i = 0; i < ${#ENTRY_IDS[@]}; i++)); do
+        if [ "${ENTRY_IDS[$i]}" = "$id" ]; then
+            if [ -n "${ENTRY_DESCS[$i]}" ]; then
+                echo "${ENTRY_DESCS[$i]}"
+            else
+                echo "$id"
+            fi
+            return 0
+        fi
+    done
+    echo "$id"
+}
+
+# ============ Main ============
+if [ "$help" -eq 1 ] || { [ -z "$command" ] && [ "$list" -eq 0 ]; }; then
+    show_help
+    exit 0
+fi
+
+parse_uefi
+
+if [ ${#ENTRY_IDS[@]} -eq 0 ]; then
+    printf '%b\n' "${C_RED}Cannot read UEFI boot entries. Make sure the system boots in UEFI mode.${C_RESET}"
+    exit 1
+fi
+
+# -------- --list --------
+if [ "$list" -eq 1 ]; then
+    printf '%b\n' "${C_CYAN}UEFI boot entries:${C_RESET}"
+    for ((i = 0; i < ${#ENTRY_IDS[@]}; i++)); do
+        printf '  [%2d] %-30s %s\n' "$((i + 1))" "${ENTRY_DESCS[$i]}" "${ENTRY_PATHS[$i]}"
+        printf '       %b%s%b\n' "$C_GRAY" "${ENTRY_IDS[$i]}" "$C_RESET"
+    done
+
+    if [ ${#BOOT_ORDER[@]} -gt 0 ]; then
+        echo ''
+        printf '%b\n' "${C_CYAN}Current BootOrder (default priority):${C_RESET}"
+
+        declare -A tagged=()
+        for key in windows ubuntu usb; do
+            case "$key" in
+                windows) pats=("Windows") ;;
+                ubuntu)  pats=("ubuntu") ;;
+                usb)     pats=("USB HDD" "USB CD" "USB FDD" "USB") ;;
+            esac
+            if idx=$(find_entry_by_patterns "${pats[@]}"); then
+                tagged["${ENTRY_IDS[$idx]}"]="$key"
+            fi
+        done
+
+        for id in "${BOOT_ORDER[@]}"; do
+            desc=$(desc_of_id "$id")
+            printf '  %s  %s' "$id" "$desc"
+            if [ -n "${tagged[$id]:-}" ]; then
+                printf '%b(%s)%b\n' "$C_YELLOW" "${tagged[$id]}" "$C_RESET"
+            else
+                echo ''
+            fi
+        done
+    fi
+    exit 0
+fi
+
+# -------- Resolve target --------
+case "$command" in
+    windows) patterns=("Windows") ;;
+    ubuntu)  patterns=("ubuntu") ;;
+    usb)     patterns=("USB HDD" "USB CD" "USB FDD" "USB") ;;
+    *)       patterns=("$command") ;;
+esac
+
+if ! idx=$(find_entry_by_patterns "${patterns[@]}"); then
+    printf '%b\n' "${C_RED}No boot entry matches '${patterns[*]}'.${C_RESET}"
+    printf '%b\n' "${C_YELLOW}Use --list to see all available entries.${C_RESET}"
+    exit 1
+fi
+
+target_id="${ENTRY_IDS[$idx]}"
+target_desc="${ENTRY_DESCS[$idx]}"
+[ -z "$target_desc" ] && target_desc="$target_id"
+
+if [ "$only_next" -eq 1 ]; then
+    # -------- One-shot: set BootNext --------
+    if ! efibootmgr -n "$target_id" >/dev/null 2>&1; then
+        printf '%b\n' "${C_RED}Failed to set BootNext.${C_RESET}"
+        exit 1
+    fi
+
+    # Self-verify
+    verify=$(efibootmgr 2>/dev/null | awk -F': ' '/^BootNext:/ {print $2}' | tr -d '[:space:]')
+    if [ "$verify" != "$target_id" ]; then
+        printf '%b\n' "${C_YELLOW}Warning: BootNext change could not be verified.${C_RESET}"
+        exit 1
+    fi
+
+    default_name="(unknown)"
+    if [ ${#BOOT_ORDER[@]} -gt 0 ]; then
+        default_name=$(desc_of_id "${BOOT_ORDER[0]}")
+    fi
+
+    printf '%b' "${C_GREEN}[OK] Next reboot use ${C_RESET}"
+    printf '%b' "${C_YELLOW}${target_desc}${C_RESET}"
+    printf '%b\n' "${C_GREEN} (only next), default is ${default_name}.${C_RESET}"
+else
+    # -------- Permanent: set default BootOrder --------
+    if [ ${#BOOT_ORDER[@]} -eq 0 ]; then
+        printf '%b\n' "${C_RED}Cannot read current BootOrder; use -1 instead.${C_RESET}"
+        exit 1
+    fi
+
+    new_order=("$target_id")
+    for id in "${BOOT_ORDER[@]}"; do
+        if [ "$id" != "$target_id" ]; then
+            new_order+=("$id")
+        fi
+    done
+    new_order_str=$(IFS=,; echo "${new_order[*]}")
+
+    if ! efibootmgr -o "$new_order_str" >/dev/null 2>&1; then
+        printf '%b\n' "${C_RED}Failed to set default BootOrder.${C_RESET}"
+        exit 1
+    fi
+
+    # Self-verify
+    parse_uefi
+    if [ ${#BOOT_ORDER[@]} -eq 0 ] || [ "${BOOT_ORDER[0]}" != "$target_id" ]; then
+        printf '%b\n' "${C_YELLOW}Warning: BootOrder change could not be verified.${C_RESET}"
+        exit 1
+    fi
+
+    printf '%b' "${C_GREEN}[OK] Next reboot use ${C_RESET}"
+    printf '%b' "${C_YELLOW}${target_desc}${C_RESET}"
+    printf '%b\n' "${C_GREEN} (permanent).${C_RESET}"
+fi
+
+# -------- Reboot handling --------
+if [ "$no_reboot" -eq 1 ]; then
+    exit 0
+fi
+
+if [ "$yes_reboot" -eq 1 ]; then
+    printf '%b\n' "${C_YELLOW}Rebooting...${C_RESET}"
+    reboot
+    exit 0
+fi
+
+read -r -p 'Reboot now? (Y/N) [N] ' ans
+case "$ans" in
+    [Yy]*)
+        printf '%b\n' "${C_YELLOW}Rebooting...${C_RESET}"
+        reboot
+        ;;
+    *)
+        printf '%b\n' "${C_CYAN}Reboot canceled.${C_RESET}"
+        ;;
+esac
