@@ -17,32 +17,32 @@
 + 为了避免字符集问题，全部使用英文；
 
 ### 使用方法
-bootnext - Quickly switch the boot OS.
-
-Usage:
-    bootnext <target> [options]
-
-Targets:
-    ubuntu          Boot into Ubuntu
-    windows         Boot into Windows
-    usb             Boot from a USB device
-
-Options:
-    -h, --help      Show this help
-    -l, --list      List all UEFI boot entries  (-l is lowercase letter L)
-    -1, --only-next Set BootNext only, one-shot (-1 is number one)
-    -d, --default   Change default BootOrder (default, mutually exclusive with -1)
-    -n, --no-reboot Do not reboot (mutually exclusive with -y)
-    -y, --reboot    Reboot now    (mutually exclusive with -n)
-
-Examples:
-    bootnext ubuntu               # permanent switch to Ubuntu; ask before reboot
-    bootnext ubuntu --default     # same as above
-    bootnext windows --only-next  # one-shot boot to Windows; ask before reboot
-    bootnext ubuntu -1 -n         # one-shot, do not reboot
-    bootnext ubuntu -1 -y         # one-shot, reboot immediately
-    bootnext --list
-
+bootnext - Quickly switch the boot OS.  
+  
+Usage:  
+    bootnext <target> [options]  
+  
+Targets:  
+    ubuntu          Boot into Ubuntu  
+    windows         Boot into Windows  
+    usb             Boot from a USB device  
+  
+Options:  
+    -h, --help      Show this help  
+    -l, --list      List all UEFI boot entries  (-l is lowercase letter L)  
+    -1, --only-next Set BootNext only, one-shot (-1 is number one)  
+    -d, --default   Change default BootOrder (default, mutually exclusive with -1)  
+    -n, --no-reboot Do not reboot (mutually exclusive with -y)  
+    -y, --reboot    Reboot now    (mutually exclusive with -n)  
+  
+Examples:  
+    bootnext ubuntu               # permanent switch to Ubuntu; ask before reboot  
+    bootnext ubuntu --default     # same as above  
+    bootnext windows --only-next  # one-shot boot to Windows; ask before reboot  
+    bootnext ubuntu -1 -n         # one-shot, do not reboot  
+    bootnext ubuntu -1 -y         # one-shot, reboot immediately  
+    bootnext --list  
+  
 或  
 bootnext --help
 
